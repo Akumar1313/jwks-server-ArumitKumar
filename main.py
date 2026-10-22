@@ -1,17 +1,19 @@
 """
-JWKS Server Implementation
-Fulfills RESTful JWKS endpoint and /auth JWT issuance requirements.
+JWKS Server Implementation - Project 2
+RESTful JWKS server backed by a SQLite database for persistent RSA key storage.
 """
 
 import base64
 import json
+import sqlite3
 import time
-import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 import jwt
+
+DB_FILE = "totally_not_my_privateKeys.db"
 
 
 def int_to_base64url(val: int) -> str:
@@ -21,85 +23,140 @@ def int_to_base64url(val: int) -> str:
     return base64.urlsafe_b64encode(val_bytes).rstrip(b"=").decode("ascii")
 
 
-class KeyManager:
-    """Generates and manages RSA key pairs with kid and expiration timestamps."""
+def get_db_connection(db_file: str = DB_FILE) -> sqlite3.Connection:
+    """Creates and returns a connection to the SQLite database."""
+    conn = sqlite3.connect(db_file)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-    def __init__(self):
-        self.keys = []
-        self._init_keys()
 
-    def generate_key(self, expires_at: int, kid: str = None):
-        """Generates an RSA private key and stores its metadata."""
-        if kid is None:
-            kid = str(uuid.uuid4())
+def init_db(db_file: str = DB_FILE):
+    """Initializes the SQLite schema and ensures initial active and expired keys exist."""
+    conn = get_db_connection(db_file)
+    cursor = conn.cursor()
 
-        private_key = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=2048
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS keys(
+            kid INTEGER PRIMARY KEY AUTOINCREMENT,
+            key BLOB NOT NULL,
+            exp INTEGER NOT NULL
+        )
+        """
+    )
+    conn.commit()
+
+    now = int(time.time())
+
+    # Check if we already have at least one valid key
+    cursor.execute("SELECT kid FROM keys WHERE exp > ? LIMIT 1", (now,))
+    if not cursor.fetchone():
+        insert_key(expires_at=now + 3600, db_file=db_file)
+
+    # Check if we already have at least one expired key
+    cursor.execute("SELECT kid FROM keys WHERE exp <= ? LIMIT 1", (now,))
+    if not cursor.fetchone():
+        insert_key(expires_at=now - 3600, db_file=db_file)
+
+    conn.close()
+
+
+def insert_key(expires_at: int, db_file: str = DB_FILE) -> int:
+    """Generates an RSA private key, serializes to PKCS8 PEM, and stores it in the DB."""
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048
+    )
+
+    pem_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+
+    conn = get_db_connection(db_file)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO keys (key, exp) VALUES (?, ?)",
+        (pem_bytes, expires_at)
+    )
+    conn.commit()
+    kid = cursor.lastrowid
+    conn.close()
+    return kid
+
+
+def get_key_from_db(expired: bool = False, db_file: str = DB_FILE):
+    """
+    Retrieves a private key row from SQLite.
+    If no matching key is found, one is dynamically generated and stored.
+    """
+    now = int(time.time())
+    conn = get_db_connection(db_file)
+    cursor = conn.cursor()
+
+    if expired:
+        cursor.execute(
+            "SELECT kid, key, exp FROM keys WHERE exp <= ? ORDER BY exp ASC LIMIT 1",
+            (now,)
+        )
+    else:
+        cursor.execute(
+            "SELECT kid, key, exp FROM keys WHERE exp > ? ORDER BY exp DESC LIMIT 1",
+            (now,)
         )
 
-        key_record = {
-            "kid": kid,
-            "private_key": private_key,
-            "public_key": private_key.public_key(),
-            "expires_at": expires_at
+    row = cursor.fetchone()
+    conn.close()
+
+    if row is None:
+        new_exp = now - 3600 if expired else now + 3600
+        kid = insert_key(expires_at=new_exp, db_file=db_file)
+        return get_key_by_kid(kid, db_file=db_file)
+
+    return row
+
+
+def get_key_by_kid(kid: int, db_file: str = DB_FILE):
+    """Fetches a specific key record by its integer kid."""
+    conn = get_db_connection(db_file)
+    cursor = conn.cursor()
+    cursor.execute("SELECT kid, key, exp FROM keys WHERE kid = ?", (kid,))
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+
+def get_valid_jwks(db_file: str = DB_FILE) -> dict:
+    """Reads all non-expired keys from SQLite and builds a JWKS response dictionary."""
+    now = int(time.time())
+    conn = get_db_connection(db_file)
+    cursor = conn.cursor()
+    cursor.execute("SELECT kid, key, exp FROM keys WHERE exp > ?", (now,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    jwk_list = []
+    for row in rows:
+        private_key = serialization.load_pem_private_key(row["key"], password=None)
+        pub_numbers = private_key.public_key().public_numbers()
+        jwk = {
+            "kty": "RSA",
+            "use": "sig",
+            "alg": "RS256",
+            "kid": str(row["kid"]),
+            "n": int_to_base64url(pub_numbers.n),
+            "e": int_to_base64url(pub_numbers.e)
         }
-        self.keys.append(key_record)
-        return key_record
+        jwk_list.append(jwk)
 
-    def _init_keys(self):
-        """Pre-seeds an active key and an expired key."""
-        now = int(time.time())
-        # Unexpired key (valid for 1 hour)
-        self.generate_key(expires_at=now + 3600, kid="active-key-1")
-        # Expired key (expired 1 hour ago)
-        self.generate_key(expires_at=now - 3600, kid="expired-key-1")
-
-    def get_valid_key(self):
-        """Returns the first non-expired key record."""
-        now = int(time.time())
-        for k in self.keys:
-            if k["expires_at"] > now:
-                return k
-        # If none found, generate one dynamically
-        return self.generate_key(expires_at=now + 3600)
-
-    def get_expired_key(self):
-        """Returns the first expired key record."""
-        now = int(time.time())
-        for k in self.keys:
-            if k["expires_at"] <= now:
-                return k
-        # If none found, generate one dynamically
-        return self.generate_key(expires_at=now - 3600)
-
-    def get_jwks(self):
-        """Returns the JWKS dictionary containing only unexpired public keys."""
-        now = int(time.time())
-        jwk_list = []
-
-        for k in self.keys:
-            if k["expires_at"] > now:
-                pub_numbers = k["public_key"].public_numbers()
-                jwk = {
-                    "kty": "RSA",
-                    "use": "sig",
-                    "alg": "RS256",
-                    "kid": k["kid"],
-                    "n": int_to_base64url(pub_numbers.n),
-                    "e": int_to_base64url(pub_numbers.e)
-                }
-                jwk_list.append(jwk)
-
-        return {"keys": jwk_list}
-
-
-# Shared key manager instance
-KEY_MANAGER = KeyManager()
+    return {"keys": jwk_list}
 
 
 class JWKSRequestHandler(BaseHTTPRequestHandler):
-    """Handles HTTP requests for JWKS and Auth endpoints."""
+    """Handles HTTP requests for JWKS and Auth endpoints using SQLite backend."""
+
+    db_file = DB_FILE
 
     def _send_json(self, status_code: int, data: dict):
         """Helper to send JSON response with appropriate headers."""
@@ -117,13 +174,11 @@ class JWKSRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
 
-        # Standard well-known JWKS endpoint
         if parsed.path == "/.well-known/jwks.json":
-            jwks_data = KEY_MANAGER.get_jwks()
+            jwks_data = get_valid_jwks(db_file=self.db_file)
             self._send_json(200, jwks_data)
             return
 
-        # Handle disallowed methods on /auth or 404s
         if parsed.path == "/auth":
             self._send_error_status(405, "Method Not Allowed")
             return
@@ -135,17 +190,14 @@ class JWKSRequestHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/auth":
             query_params = parse_qs(parsed.query)
-            # Check for the ?expired flag
             is_expired = "expired" in query_params
 
-            now = int(time.time())
-            if is_expired:
-                key_record = KEY_MANAGER.get_expired_key()
-                exp_time = key_record["expires_at"]
-            else:
-                key_record = KEY_MANAGER.get_valid_key()
-                exp_time = key_record["expires_at"]
+            row = get_key_from_db(expired=is_expired, db_file=self.db_file)
+            kid = row["kid"]
+            pem_bytes = row["key"]
+            exp_time = row["exp"]
 
+            now = int(time.time())
             payload = {
                 "sub": "fake-user-123",
                 "iat": now if not is_expired else exp_time - 3600,
@@ -154,20 +206,13 @@ class JWKSRequestHandler(BaseHTTPRequestHandler):
             }
 
             headers = {
-                "kid": key_record["kid"],
+                "kid": str(kid),
                 "alg": "RS256"
             }
 
-            # Serialize private key to PEM for PyJWT signing
-            pem_private_key = key_record["private_key"].private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption()
-            )
-
             token = jwt.encode(
                 payload=payload,
-                key=pem_private_key,
+                key=pem_bytes,
                 algorithm="RS256",
                 headers=headers
             )
@@ -195,9 +240,10 @@ class JWKSRequestHandler(BaseHTTPRequestHandler):
 
 
 def run_server(port: int = 8080):
+    init_db()
     server_address = ("", port)
     httpd = HTTPServer(server_address, JWKSRequestHandler)
-    print(f"JWKS Server serving on port {port}...")
+    print(f"JWKS Server running on port {port} using database '{DB_FILE}'...")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
