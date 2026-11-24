@@ -26,6 +26,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 DB_FILE = "totally_not_my_privateKeys.db"
 NONCE_SIZE = 12  # 96-bit nonce recommended for AES-GCM
 DB_LOCK = threading.Lock()
+_DECRYPTED_KEY_CACHE = {}
 
 # Configurable Argon2 password hasher
 password_hasher = PasswordHasher(
@@ -38,7 +39,7 @@ password_hasher = PasswordHasher(
 
 
 class ThreadedJWKSServer(ThreadingHTTPServer):
-    """ThreadingHTTPServer with a larger socket backlog for burst traffic."""
+    """ThreadingHTTPServer configured with a larger socket backlog for burst traffic."""
 
     request_queue_size = 128
     allow_reuse_address = True
@@ -47,17 +48,17 @@ class ThreadedJWKSServer(ThreadingHTTPServer):
 class RateLimiter:
     """Thread-safe sliding-window rate limiter."""
 
-    def __init__(self, max_requests: int = 10, window_seconds: float = 1.0):
+    def __init__(self, max_requests: int = 10, window_seconds: float = 1.05):
+        """Initialize the rate limiter with a maximum request count and time window."""
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self._timestamps = deque()
         self._lock = threading.Lock()
 
     def is_allowed(self) -> bool:
-        """Returns True if the request is within the allowed rate limit."""
+        """Return True if the current request falls within the allowed rate limit."""
         now = time.monotonic()
         with self._lock:
-            # Drop timestamps that have fallen outside the sliding window
             while self._timestamps and (now - self._timestamps[0]) >= self.window_seconds:
                 self._timestamps.popleft()
 
@@ -68,7 +69,7 @@ class RateLimiter:
             return True
 
     def reset(self):
-        """Clears tracked request timestamps (useful for testing)."""
+        """Clear all tracked request timestamps."""
         with self._lock:
             self._timestamps.clear()
 
@@ -82,7 +83,7 @@ def int_to_base64url(val: int) -> str:
 
 def get_aes_key() -> bytes:
     """
-    Retrieves the secret from the NOT_MY_KEY environment variable and derives
+    Retrieve the secret from the NOT_MY_KEY environment variable and derive
     a fixed 32-byte (256-bit) AES key using SHA-256.
     """
     raw_key = os.environ.get("NOT_MY_KEY")
@@ -93,7 +94,7 @@ def get_aes_key() -> bytes:
 
 def encrypt_private_key(pem_bytes: bytes) -> bytes:
     """
-    Encrypts PEM private key bytes using AES-256-GCM with a random 12-byte IV/nonce.
+    Encrypt PEM private key bytes using AES-256-GCM with a random 12-byte IV/nonce.
     The nonce is prepended to the ciphertext so it can be retrieved during decryption.
     """
     aesgcm = AESGCM(get_aes_key())
@@ -103,11 +104,22 @@ def encrypt_private_key(pem_bytes: bytes) -> bytes:
 
 
 def decrypt_private_key(encrypted_blob: bytes) -> bytes:
-    """Decrypts an AES-256-GCM encrypted private key blob (nonce + ciphertext)."""
+    """Decrypt an AES-256-GCM encrypted private key blob (nonce + ciphertext)."""
     aesgcm = AESGCM(get_aes_key())
     nonce = encrypted_blob[:NONCE_SIZE]
     ciphertext = encrypted_blob[NONCE_SIZE:]
     return aesgcm.decrypt(nonce, ciphertext, None)
+
+
+def load_cached_private_key(encrypted_blob: bytes):
+    """Decrypt and load an RSA private key object, caching parsed keys for fast signing."""
+    cached = _DECRYPTED_KEY_CACHE.get(encrypted_blob)
+    if cached is not None:
+        return cached
+    pem_bytes = decrypt_private_key(encrypted_blob)
+    private_key = serialization.load_pem_private_key(pem_bytes, password=None)
+    _DECRYPTED_KEY_CACHE[encrypted_blob] = private_key
+    return private_key
 
 
 @contextmanager
@@ -132,7 +144,7 @@ def db_connection(db_file: str = DB_FILE):
 
 
 def init_db(db_file: str = DB_FILE):
-    """Initializes SQLite tables (keys, users, auth_logs) and seeds initial RSA keys."""
+    """Initialize SQLite tables (keys, users, auth_logs) and seed initial RSA keys."""
     with db_connection(db_file) as conn:
         cursor = conn.cursor()
 
@@ -185,7 +197,7 @@ def init_db(db_file: str = DB_FILE):
 
 
 def insert_key(expires_at: int, db_file: str = DB_FILE) -> int:
-    """Generates an RSA private key, AES-encrypts it, and stores it in SQLite."""
+    """Generate an RSA private key, AES-encrypt it, and store it in SQLite."""
     private_key = rsa.generate_private_key(
         public_exponent=65537,
         key_size=2048,
@@ -198,6 +210,7 @@ def insert_key(expires_at: int, db_file: str = DB_FILE) -> int:
     )
 
     encrypted_key = encrypt_private_key(pem_bytes)
+    _DECRYPTED_KEY_CACHE[encrypted_key] = private_key
 
     with db_connection(db_file) as conn:
         cursor = conn.cursor()
@@ -209,7 +222,7 @@ def insert_key(expires_at: int, db_file: str = DB_FILE) -> int:
 
 
 def get_key_by_kid(kid: int, db_file: str = DB_FILE):
-    """Fetches a specific key record by its integer kid."""
+    """Fetch a specific key record by its integer kid."""
     with db_connection(db_file) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT kid, key, exp FROM keys WHERE kid = ?", (kid,))
@@ -218,7 +231,7 @@ def get_key_by_kid(kid: int, db_file: str = DB_FILE):
 
 def get_key_from_db(expired: bool = False, db_file: str = DB_FILE):
     """
-    Retrieves an encrypted private key row from SQLite.
+    Retrieve an encrypted private key row from SQLite.
     If no matching key is found, one is dynamically generated and stored.
     """
     now = int(time.time())
@@ -245,7 +258,7 @@ def get_key_from_db(expired: bool = False, db_file: str = DB_FILE):
 
 
 def get_valid_jwks(db_file: str = DB_FILE) -> dict:
-    """Decrypts all non-expired keys from SQLite and builds a JWKS response dictionary."""
+    """Decrypt all non-expired keys from SQLite and build a JWKS response dictionary."""
     now = int(time.time())
     with db_connection(db_file) as conn:
         cursor = conn.cursor()
@@ -254,8 +267,7 @@ def get_valid_jwks(db_file: str = DB_FILE) -> dict:
 
     jwk_list = []
     for row in rows:
-        pem_bytes = decrypt_private_key(row["key"])
-        private_key = serialization.load_pem_private_key(pem_bytes, password=None)
+        private_key = load_cached_private_key(row["key"])
         pub_numbers = private_key.public_key().public_numbers()
         jwk_list.append(
             {
@@ -273,8 +285,8 @@ def get_valid_jwks(db_file: str = DB_FILE) -> dict:
 
 def register_user(username: str, email: str = None, db_file: str = DB_FILE) -> str:
     """
-    Generates a UUIDv4 password, hashes it with Argon2, stores the user,
-    and returns the plaintext password.
+    Generate a UUIDv4 password, hash it with Argon2, store the user,
+    and return the plaintext password.
     """
     raw_password = str(uuid.uuid4())
     hashed_password = password_hasher.hash(raw_password)
@@ -289,21 +301,21 @@ def register_user(username: str, email: str = None, db_file: str = DB_FILE) -> s
     return raw_password
 
 
-def get_user_id_by_username(username: str, db_file: str = DB_FILE):
-    """Looks up a user's integer ID by username, returning None if not found."""
-    if not username:
-        return None
+def record_successful_auth(
+    request_ip: str,
+    username: str = None,
+    db_file: str = DB_FILE,
+):
+    """Look up user_id (if username provided), log the auth request, and update last_login."""
     with db_connection(db_file) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
-        row = cursor.fetchone()
-        return row["id"] if row else None
+        user_id = None
+        if username:
+            cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
+            row = cursor.fetchone()
+            if row:
+                user_id = row["id"]
 
-
-def log_auth_request(request_ip: str, user_id=None, db_file: str = DB_FILE):
-    """Logs a successful authentication request into auth_logs and updates last_login."""
-    with db_connection(db_file) as conn:
-        cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO auth_logs (request_ip, user_id) VALUES (?, ?)",
             (request_ip, user_id),
@@ -319,10 +331,14 @@ class JWKSRequestHandler(BaseHTTPRequestHandler):
     """Handles HTTP requests for JWKS, Registration, and Auth endpoints."""
 
     db_file = DB_FILE
-    rate_limiter = RateLimiter(max_requests=10, window_seconds=1.0)
+    rate_limiter = RateLimiter(max_requests=10, window_seconds=1.05)
+
+    def address_string(self) -> str:
+        """Return the client IP directly to avoid slow reverse-DNS lookups."""
+        return self.client_address[0]
 
     def _send_json(self, status_code: int, data: dict):
-        """Helper to send a JSON response with appropriate headers."""
+        """Send a JSON response with Content-Type and Content-Length headers."""
         response_bytes = json.dumps(data).encode("utf-8")
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
@@ -331,11 +347,11 @@ class JWKSRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(response_bytes)
 
     def _send_error_status(self, status_code: int, message: str):
-        """Helper to send standard HTTP error status codes."""
+        """Send a standardized JSON error response."""
         self._send_json(status_code, {"error": message})
 
     def _read_json_body(self) -> dict:
-        """Safely reads and parses an optional JSON request body."""
+        """Read and parse an optional JSON request body."""
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length <= 0:
             return {}
@@ -343,7 +359,7 @@ class JWKSRequestHandler(BaseHTTPRequestHandler):
         return json.loads(raw_body.decode("utf-8"))
 
     def _extract_username(self, body: dict):
-        """Extracts username from JSON body or HTTP Basic Auth header if present."""
+        """Extract username from a JSON request body or HTTP Basic Auth header."""
         if isinstance(body, dict) and body.get("username"):
             return body["username"]
 
@@ -356,7 +372,83 @@ class JWKSRequestHandler(BaseHTTPRequestHandler):
                 return None
         return None
 
+    def _handle_register(self):
+        """Process POST /register requests and return a generated UUIDv4 password."""
+        try:
+            body = self._read_json_body()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_error_status(400, "Invalid JSON payload")
+            return
+
+        username = body.get("username") if isinstance(body, dict) else None
+        email = body.get("email") if isinstance(body, dict) else None
+
+        if not username:
+            self._send_error_status(400, "Missing required field: username")
+            return
+
+        try:
+            generated_password = register_user(
+                username=username,
+                email=email,
+                db_file=self.db_file,
+            )
+            self._send_json(201, {"password": generated_password})
+        except sqlite3.IntegrityError:
+            self._send_error_status(409, "Username or email already exists")
+        except sqlite3.Error as exc:
+            self._send_error_status(500, f"Database error: {exc}")
+
+    def _handle_auth(self, parsed_url):
+        """Enforce rate limiting, issue a signed JWT, and log successful requests."""
+        if not self.rate_limiter.is_allowed():
+            self._send_error_status(429, "Too Many Requests")
+            return
+
+        try:
+            body = self._read_json_body()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            body = {}
+
+        query_params = parse_qs(parsed_url.query)
+        is_expired = "expired" in query_params
+
+        try:
+            row = get_key_from_db(expired=is_expired, db_file=self.db_file)
+            kid = row["kid"]
+            private_key = load_cached_private_key(row["key"])
+            exp_time = row["exp"]
+
+            username = self._extract_username(body)
+
+            now = int(time.time())
+            payload = {
+                "sub": username or "fake-user-123",
+                "iat": now if not is_expired else exp_time - 3600,
+                "exp": exp_time,
+                "iss": "jwks-auth-server",
+            }
+            headers = {"kid": str(kid), "alg": "RS256"}
+
+            token = jwt.encode(
+                payload=payload,
+                key=private_key,
+                algorithm="RS256",
+                headers=headers,
+            )
+
+            record_successful_auth(
+                request_ip=self.client_address[0],
+                username=username,
+                db_file=self.db_file,
+            )
+
+            self._send_json(200, {"token": token})
+        except (sqlite3.Error, EnvironmentError, ValueError) as exc:
+            self._send_error_status(500, f"Internal Server Error: {exc}")
+
     def do_GET(self):
+        """Route incoming HTTP GET requests."""
         parsed = urlparse(self.path)
 
         if parsed.path == "/.well-known/jwks.json":
@@ -374,85 +466,15 @@ class JWKSRequestHandler(BaseHTTPRequestHandler):
         self._send_error_status(404, "Not Found")
 
     def do_POST(self):
+        """Route incoming HTTP POST requests."""
         parsed = urlparse(self.path)
 
         if parsed.path == "/register":
-            try:
-                body = self._read_json_body()
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                self._send_error_status(400, "Invalid JSON payload")
-                return
-
-            username = body.get("username") if isinstance(body, dict) else None
-            email = body.get("email") if isinstance(body, dict) else None
-
-            if not username:
-                self._send_error_status(400, "Missing required field: username")
-                return
-
-            try:
-                generated_password = register_user(
-                    username=username,
-                    email=email,
-                    db_file=self.db_file,
-                )
-                self._send_json(201, {"password": generated_password})
-            except sqlite3.IntegrityError:
-                self._send_error_status(409, "Username or email already exists")
-            except sqlite3.Error as exc:
-                self._send_error_status(500, f"Database error: {exc}")
+            self._handle_register()
             return
 
         if parsed.path == "/auth":
-            # Enforce rate limit before processing or logging the request
-            if not self.rate_limiter.is_allowed():
-                self._send_error_status(429, "Too Many Requests")
-                return
-
-            try:
-                body = self._read_json_body()
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                body = {}
-
-            query_params = parse_qs(parsed.query)
-            is_expired = "expired" in query_params
-
-            try:
-                row = get_key_from_db(expired=is_expired, db_file=self.db_file)
-                kid = row["kid"]
-                pem_bytes = decrypt_private_key(row["key"])
-                exp_time = row["exp"]
-
-                username = self._extract_username(body)
-                user_id = get_user_id_by_username(username, db_file=self.db_file)
-
-                now = int(time.time())
-                payload = {
-                    "sub": username or "fake-user-123",
-                    "iat": now if not is_expired else exp_time - 3600,
-                    "exp": exp_time,
-                    "iss": "jwks-auth-server",
-                }
-                headers = {"kid": str(kid), "alg": "RS256"}
-
-                token = jwt.encode(
-                    payload=payload,
-                    key=pem_bytes,
-                    algorithm="RS256",
-                    headers=headers,
-                )
-
-                # Log only successful authentication requests
-                request_ip = self.client_address[0]
-                log_auth_request(
-                    request_ip=request_ip,
-                    user_id=user_id,
-                    db_file=self.db_file,
-                )
-
-                self._send_json(200, {"token": token})
-            except (sqlite3.Error, EnvironmentError, ValueError) as exc:
-                self._send_error_status(500, f"Internal Server Error: {exc}")
+            self._handle_auth(parsed)
             return
 
         if parsed.path == "/.well-known/jwks.json":
@@ -462,19 +484,23 @@ class JWKSRequestHandler(BaseHTTPRequestHandler):
         self._send_error_status(404, "Not Found")
 
     def do_PUT(self):
+        """Reject HTTP PUT requests with 405 Method Not Allowed."""
         self._send_error_status(405, "Method Not Allowed")
 
     def do_DELETE(self):
+        """Reject HTTP DELETE requests with 405 Method Not Allowed."""
         self._send_error_status(405, "Method Not Allowed")
 
     def do_PATCH(self):
+        """Reject HTTP PATCH requests with 405 Method Not Allowed."""
         self._send_error_status(405, "Method Not Allowed")
 
 
 def run_server(port: int = 8080):
-    init_db()
+    """Bind the server socket immediately, initialize the database, and serve requests."""
     server_address = ("", port)
     httpd = ThreadedJWKSServer(server_address, JWKSRequestHandler)
+    init_db()
     print(f"JWKS Server running on port {port} using database '{DB_FILE}'...")
     try:
         httpd.serve_forever()

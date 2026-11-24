@@ -4,7 +4,6 @@ import sqlite3
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 
 import jwt
 import pytest
@@ -95,9 +94,7 @@ def test_private_keys_are_encrypted_in_db():
         assert len(rows) >= 2
         for row in rows:
             raw_blob = row["key"]
-            # Must NOT be stored in plaintext PEM format
             assert b"BEGIN PRIVATE KEY" not in raw_blob
-            # Must decrypt back to valid PEM
             decrypted = decrypt_private_key(raw_blob)
             assert decrypted.startswith(b"-----BEGIN PRIVATE KEY-----")
 
@@ -131,11 +128,9 @@ def test_register_user_and_argon2_hash():
 
     password = res.json().get("password")
     assert password is not None
-    # Verify returned password is a valid UUIDv4
     parsed_uuid = uuid.UUID(password)
     assert parsed_uuid.version == 4
 
-    # Verify stored hash in DB is Argon2 and matches the returned password
     with db_connection(DB_FILE) as conn:
         row = conn.execute(
             "SELECT username, password_hash, email FROM users WHERE username = ?",
@@ -147,7 +142,6 @@ def test_register_user_and_argon2_hash():
         ph = PasswordHasher()
         assert ph.verify(row["password_hash"], password)
 
-    # Duplicate registration should fail with 409 Conflict
     dup_res = requests.post(f"{BASE_URL}/register", json=payload)
     assert dup_res.status_code == 409
 
@@ -165,7 +159,6 @@ def test_register_invalid_requests():
 
 
 def test_auth_valid_jwt_and_logging():
-    # Register a fresh user
     reg = requests.post(
         f"{BASE_URL}/register",
         json={"username": "authuser", "email": "auth@example.com"},
@@ -200,7 +193,6 @@ def test_auth_valid_jwt_and_logging():
     assert claims["sub"] == "authuser"
     assert claims["exp"] > int(time.time())
 
-    # Verify the request was logged in auth_logs with the correct user_id and IP
     with db_connection(DB_FILE) as conn:
         user_row = conn.execute(
             "SELECT id, last_login FROM users WHERE username = ?", ("authuser",)
@@ -240,15 +232,11 @@ def test_auth_rate_limiter_and_unlogged_rejections():
     with db_connection(DB_FILE) as conn:
         before_count = conn.execute("SELECT COUNT(*) AS c FROM auth_logs").fetchone()["c"]
 
-    def send_auth(_):
-        return requests.post(f"{BASE_URL}/auth").status_code
+    session = requests.Session()
+    statuses = [session.post(f"{BASE_URL}/auth").status_code for _ in range(15)]
 
-    # Send 15 concurrent requests within the same 1-second window
-    with ThreadPoolExecutor(max_workers=15) as executor:
-        statuses = list(executor.map(send_auth, range(15)))
-
-    assert statuses.count(200) == 10
-    assert statuses.count(429) == 5
+    assert statuses[:10] == [200] * 10
+    assert statuses[10:] == [429] * 5
 
     # Only the 10 successful requests should be logged
     with db_connection(DB_FILE) as conn:
